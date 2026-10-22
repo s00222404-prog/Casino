@@ -1,141 +1,119 @@
-require('dotenv').config();
-const express = require('express');
-const compression = require('compression');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const path = require('path');
+const axios = require('axios');
+const config = require('./config');
+const { User } = require('./db');
 
-// Импортируем логику нашего бота и базу данных из src/bot.js
-const { initWebhook, handleWebhookUpdate, checkSubscription, usersDB } = require('./bot');
+const TELEGRAM_API = `https://telegram.org{config.BOT_TOKEN}`;
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-// Берем URL сервера из Render или используем локальный адрес
-const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
-
-// Ограничение запросов для защиты казино от накруток и DDoS
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300, 
-  message: { error: 'Слишком много запросов от игры!' }
-});
-app.use('/api/', limiter);
-
-// Настройка безопасности под WebAssembly и WebGL для C++ игры
-app.use(helmet({
-  crossOriginResourcePolicy: false,
-  crossOriginEmbedderPolicy: false 
-}));
-
-app.use(cors());
-app.use(express.json());
-app.use(compression()); // Сжимает тяжелый .wasm движок при загрузке
-
-// Правильный Content-Type для WebAssembly, чтобы браузер внутри Telegram запустил C++ код
-express.static.mime.define({ 'application/wasm': ['wasm'] });
-
-// Раздача файлов игры (index.html, game.js, game.wasm) из папки public
-app.use(express.static(path.join(__dirname, '../public'), {
-  maxAge: '7d', 
-  immutable: true
-}));
-
-/* ========================================================
-   1. TELEGRAM WEBHOOK МАРШРУТ (Принимает сообщения бота)
-   ======================================================== */
-app.post('/api/telegram-webhook', async (req, res) => {
+/**
+ * Инициализация Webhook для Render.
+ */
+async function initWebhook(serverUrl) {
   try {
-    await handleWebhookUpdate(req.body);
-    res.sendStatus(200); // Всегда отвечаем Telegram 200 OK
+    const webhookUrl = `${serverUrl}/api/telegram-webhook`;
+    await axios.post(`${TELEGRAM_API}/setWebhook`, { url: webhookUrl });
+    console.log(`[Bot] Webhook успешно установлен на адрес: ${webhookUrl}`);
   } catch (error) {
-    console.error('Ошибка в обработчике вебхука:', error.message);
-    res.sendStatus(500);
+    console.error('[Bot] Ошибка установки Webhook:', error.message);
   }
-});
+}
 
-/* ========================================================
-   2. API МАРШРУТЫ ДЛЯ С++ КЛИЕНТА (ИГРЫ)
-   ======================================================== */
+/**
+ * Обработка входящих сообщений от Telegram (Вебхук)
+ */
+async function handleWebhookUpdate(update) {
+  if (!update.message) return;
 
-// Получить данные игрока (Баланс, звезды, рефералы)
-app.get('/api/user/:id', (req, res) => {
-  const userId = req.params.id;
-  
-  // Если игрока почему-то нет в БД, создаем стартовый баланс
-  if (!usersDB[userId]) {
-    usersDB[userId] = { balance: 0.00, stars: 250.00, referrals: 0 };
-  }
-  
-  res.json({ success: true, data: usersDB[userId] });
-});
+  const chatId = update.message.chat.id;
+  const userId = String(update.message.from.id);
+  const text = update.message.text || '';
 
-// Проверить подписки на ресурсы (канал и бот, как на вашем скриншоте)
-app.post('/api/verify-subscriptions', async (req, res) => {
-  const { tg_id } = req.body;
-  
-  // ID вашего канала или юзернейм (например, '@RelaxSquadV2' или его цифровой ID '-100xxxxxx')
-  // ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ЮЗЕРНЕЙМ ВАШЕГО КАНАЛА:
-  const REQUIRED_CHANNEL = '@RelaxSquadV2'; 
+  if (text.startsWith('/start')) {
+    // 1. Ищем пользователя в базе данных или создаем нового
+    let user = await User.findOne({ tg_id: userId });
+    
+    if (!user) {
+      user = new User({
+        tg_id: userId,
+        stars: config.START_STARS_BALANCE, // 250.00 ⭐ из конфига
+        balance: 0.00
+      });
 
-  const isSubscribedToChannel = await checkSubscription(tg_id, REQUIRED_CHANNEL);
+      // 2. Обработка реферальной ссылки (например, /start ref_123456)
+      const startArgs = text.split(' ')[1];
+      if (startArgs && startArgs.startsWith('ref_')) {
+        const referrerId = startArgs.replace('ref_', '');
 
-  if (isSubscribedToChannel) {
-    res.json({ 
-      is_subscribed: true, 
-      message: "Доступ разблокирован! 🔓" 
+        // Защита: нельзя пригласить самого себя
+        if (referrerId !== userId) {
+          user.referred_by = referrerId;
+          
+          // Находим того, кто пригласил, и начисляем ему +0.10 💠
+          const referrer = await User.findOne({ tg_id: referrerId });
+          if (referrer) {
+            referrer.balance += config.REFERRAL_REWARD; // +0.10 💠
+            referrer.referrals_count += 1;
+            await referrer.save();
+
+            // Отправляем уведомление другу в Telegram
+            await sendMessage(referrerId, `🔔 По вашей ссылке зарегистрировался новый друг! Вам начислено +${config.REFERRAL_REWARD} 💠`);
+          }
+        }
+      }
+      await user.save();
+    }
+
+    // Реферальная ссылка для самого игрока
+    const myRefLink = `https://t.me{update.message.via_bot?.username || 'your_bot_username'}?start=ref_${userId}`;
+
+    // 3. Отправляем приветствие с кнопкой запуска C++ Mini App
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: `👋 Добро пожаловать в STARS MINI CASINO!\n\n` +
+            `💰 Ваш баланс: ${user.stars.toFixed(2)} ⭐\n` +
+            `💠 Реферальный баланс: ${user.balance.toFixed(2)} 💠\n\n` +
+            `🔗 Твоя реферальная ссылка (1 друг = +0.10 💠):\n${myRefLink}`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🚀 Играть в Казино", web_app: { url: config.SERVER_URL } }
+          ]
+        ]
+      }
     });
-  } else {
-    res.json({ 
-      is_subscribed: false, 
-      message: "Требуется выполнение подписок ресурсов." 
+  }
+}
+
+/**
+ * Проверка подписки на обязательный канал через API Telegram
+ */
+async function checkSubscription(userId, channelUsername) {
+  try {
+    const response = await axios.get(`${TELEGRAM_API}/getChatMember`, {
+      params: { chat_id: channelUsername, user_id: userId }
     });
+    const status = response.data?.result?.status;
+    return ['member', 'administrator', 'creator'].includes(status);
+  } catch (error) {
+    console.error(`[Bot] Ошибка проверки подписки на ${channelUsername}:`, error.message);
+    return false;
   }
-});
+}
 
-// Запрос из C++ игры на бросок (баскетбол, кубики, кегли)
-app.post('/api/play-game', (req, res) => {
-  const { tg_id, bet_amount, bet_type } = req.body; // bet_type: 'even' (четное) или 'odd' (нечетное)
-  
-  const user = usersDB[tg_id];
-  if (!user || user.balance < bet_amount) {
-    return res.status(400).json({ success: false, error: 'Недостаточно внутренних звезд 💠' });
+/**
+ * Вспомогательная функция отправки сообщений
+ */
+async function sendMessage(chatId, text) {
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text });
+  } catch (error) {
+    console.error('[Bot] Ошибка отправки сообщения:', error.message);
   }
+}
 
-  // Списываем ставку
-  user.balance -= bet_amount;
+module.exports = {
+  initWebhook,
+  handleWebhookUpdate,
+  checkSubscription
+};
 
-  // Логика игры (например, для кубика или баскетбола генерируем результат от 1 до 6)
-  const score = Math.floor(Math.random() * 6) + 1;
-  const isEven = score % 2 === 0;
-  
-  let win = false;
-  if ((bet_type === 'even' && isEven) || (bet_type === 'odd' && !isEven)) {
-    win = true;
-    // В случае выигрыша возвращаем ставку х2 (как в казино)
-    user.balance += bet_amount * 2;
-  }
-
-  res.json({ 
-    success: true, 
-    score: score, // Результат броска для C++ анимации
-    win: win, 
-    new_balance: user.balance 
-  });
-});
-
-/* ========================================================
-   ЗАПУСК СЕРВЕРА
-   ======================================================== */
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`\n=========================================`);
-  console.log(` СЕРВЕР КАЗИНО (C++ BACKEND) СВЯЗАН С БОТОМ `);
-  console.log(` Сервер работает на порту: ${PORT}`);
-  console.log(`=========================================\n`);
-
-  // Автоматически регистрируем наш сервер в Telegram API при старте на Render
-  if (process.env.SERVER_URL) {
-    await initWebhook(SERVER_URL);
-  }
-});
                               
