@@ -136,4 +136,50 @@ int main(void) {
     CloseWindow();
     return 0;
 }
-
+DrawText("1 реферал = +0.10 внутренних звёзд 💠", 120, 1520, 28, theme.textWhite);
+DrawRectangleRounded({ 100, 1600, 880, 100 }, 0.2f, 4, theme.bgDark);
+DrawText("Твоя ссылка скопирована в буфер бота!", 140, 1635, 28, ColorAlpha(theme.textWhite, 0.6f));
+}
+// ==========================================
+// УЛЬТРАСОВРЕМЕННЫЕ ОКНА УВЕДОМЛЕНИЙ (ПОП-АПЫ)
+// ==========================================
+if (state.activePopup != POPUP_NONE) {
+// Затемняем экран
+DrawRectangle(0, 0, screenWidth, screenHeight, theme.overlayBg);
+// Считаем анимацию Elastic Эффекта
+float scale = ElasticEaseOut(state.popupAnimProgress);
+float pWidth = 880; float pHeight = 950;
+float pX = (screenWidth - pWidth) / 2.0f;
+// Окно падает сверху с пружиной
+float pY = -pHeight + ( (screenHeight - pHeight) / 2.0f + pHeight ) * scale;
+// Рисуем поп-ап стекло
+DrawCachedGlassCard({ pX, pY, pWidth, pHeight }, theme.neonGold);
+if (state.activePopup == POPUP_WIN) {
+DrawText("ПОЗДРАВЛЯЕМ! 🎉", pX + 190, pY + 100, 48, theme.neonGold);
+DrawText("🏆", pX + 340, pY + 220, 180, WHITE);
+DrawText("Вы выиграли супер-приз!", pX + 180, pY + 460, 36, theme.textWhite);
+DrawText("Баланс пополнен на +4.00 💠", pX + 160, pY + 540, 34, theme.neonBlue);
+} else if (state.activePopup == POPUP_NEED_SUB) {
+DrawText("ДОСТУП ОГРАНИЧЕН! 🔒", pX + 140, pY + 100, 46, { 255, 75, 75, 255 });
+DrawText("📢", pX + 350, pY + 220, 160, WHITE);
+DrawText("Для разблокировки игры", pX + 180, pY + 440, 36, theme.textWhite);
+DrawText("необходимо выполнить подписки", pX + 120, pY + 500, 36, theme.textWhite);
+DrawText("на ресурсы нашего спонсора.", pX + 150, pY + 560, 36, theme.textWhite);
+}
+// Кнопка "ОК / ПОНЯТНО" внутри поп-апа
+DrawRectangleRounded({ pX + 60, pY + 760, pWidth - 120, 120 }, 0.4f, 4, theme.neonBlue);
+DrawText("ОТЛИЧНО, ПОНЯТНО!", pX + 220, pY + 802, 34, theme.textWhite);
+}
+EndDrawing();
+}
+int main(void) {
+SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIGHDPI);
+InitWindow(screenWidth, screenHeight, "Ultra Smooth Casino Engine");
+// Включаем кэширование текстур перед запуском 60 FPS цикла
+CreateGlassCacheTexture();
+emscripten_set_main_loop(UpdateDrawFrame, 0, 1);
+// Выгрузка текстур при закрытии
+UnloadRenderTexture(glassCache);
+CloseWindow();
+return 0;
+}
