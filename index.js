@@ -6,67 +6,140 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const config = require('./config');
+const { connectDB, User } = require('./db');
+const { initWebhook, handleWebhookUpdate, checkSubscription } = require('./bot');
 
-// Ограничение запросов для защиты казино от читеров и DDoS
+const app = express();
+
+// Подключаем облачную базу данных MongoDB перед запуском сервера
+connectDB();
+
+// Защита и лимиты запросов для безопасной игры
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300, // Увеличили лимит, так как C++ игра может слать больше технических запросов
+  max: 300,
   message: { error: 'Слишком много запросов от игры!' }
 });
 app.use('/api/', limiter);
 
-// Настройка безопасности под WebAssembly и WebGL
 app.use(helmet({
   crossOriginResourcePolicy: false,
-  crossOriginEmbedderPolicy: false // Позволяет браузеру загружать Wasm-модули
+  crossOriginEmbedderPolicy: false // Важно для загрузки WebAssembly (C++) в браузере
 }));
 
 app.use(cors());
 app.use(express.json());
-app.use(compression()); // Сжимает тяжелый бинарник .wasm при первой загрузке у игрока
+app.use(compression()); // Сжимает тяжелые бинарники игры на лету
 
-// Настройка раздачи статических файлов (Wasm-сборка игры и графика)
-// Устанавливаем правильный Content-Type для WebAssembly, иначе браузер заблокирует игру
+// Настройка правильного MIME-типа для Wasm файлов
 express.static.mime.define({ 'application/wasm': ['wasm'] });
 
+// Раздача скомпилированной C++ игры из папки public
 app.use(express.static(path.join(__dirname, '../public'), {
-  maxAge: '7d', // Кэшируем движок игры на 7 дней в памяти телефона
+  maxAge: '7d',
   immutable: true
 }));
 
-// --- API МАРШРУТЫ ДЛЯ С++ КЛИЕНТА ---
-
-// 1. Проверить статус сервера
-app.get('/api/status', (req, res) => {
-  res.json({ status: 'Casino API is ready for C++ Client' });
+/* ========================================================
+   1. МАРШРУТ ДЛЯ ТЕЛЕГРАМ ВЕБХУКА
+   ======================================================== */
+app.post('/api/telegram-webhook', async (req, res) => {
+  try {
+    await handleWebhookUpdate(req.body);
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Ошибка в вебхуке:', error.message);
+    res.sendStatus(500);
+  }
 });
 
-// 2. Имитация проверки подписок (как на вашем скриншоте)
+/* ========================================================
+   2. API МАРШРУТЫ ДЛЯ С++ КЛИЕНТА (ИГРЫ)
+   ======================================================== */
+
+// Получить актуальный баланс игрока из базы данных
+app.get('/api/user/:id', async (req, res) => {
+  try {
+    let user = await User.findOne({ tg_id: req.params.id });
+    if (!user) {
+      user = new User({ tg_id: req.params.id, stars: config.START_STARS_BALANCE });
+      await user.save();
+    }
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Проверить подписки на каналы (как на вашем скриншоте для снятия замка 🔒)
 app.post('/api/verify-subscriptions', async (req, res) => {
-  const { tg_id } = req.body;
-  
-  // ТУТ БУДЕТ КОД ПРОВЕРКИ ЧЕРЕЗ TELEGRAM API
-  // Пока отдаем заглушку, что всё заблокировано
-  res.json({ 
-    is_subscribed: false, 
-    message: "Требуется выполнение подписок ресурсов." 
-  });
+  try {
+    const { tg_id } = req.body;
+    
+    // Проверяем подписку на канал из нашего конфига (@RelaxSquadV2)
+    const isSubscribed = await checkSubscription(tg_id, config.REQUIRED_CHANNEL);
+    
+    // Обновляем статус верификации пользователя в базе данных
+    await User.findOneAndUpdate({ tg_id: String(tg_id) }, { is_verified: isSubscribed });
+
+    if (isSubscribed) {
+      res.json({ is_subscribed: true, message: "Доступ разблокирован! 🔓" });
+    } else {
+      res.json({ is_subscribed: false, message: "Требуется выполнение подписок ресурсов." });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// 3. Запрос на запуск игры (Баскетбол/Кубики)
-app.post('/api/play', (req, res) => {
-  const { tg_id, bet_amount, game_type } = req.body;
-  // Логика списания внутренних звезд и просчет результата игры на бэкенде
-  res.json({ success: true, balance: 250.00 });
+// Списание баланса и расчет игры (Баскетбол / Кубики)
+app.post('/api/play-game', async (req, res) => {
+  try {
+    const { tg_id, bet_amount, bet_type } = req.body; // bet_type: 'even' или 'odd'
+    
+    const user = await User.findOne({ tg_id: String(tg_id) });
+    if (!user || user.balance < bet_amount) {
+      return res.status(400).json({ success: false, error: 'Недостаточно внутренних звезд 💠' });
+    }
+
+    // Списываем ставку с реферального баланса
+    user.balance -= bet_amount;
+
+    // Имитируем логику кубика/мяча (результат броска от 1 до 6)
+    const score = Math.floor(Math.random() * 6) + 1;
+    const isEven = score % 2 === 0;
+    
+    let win = false;
+    if ((bet_type === 'even' && isEven) || (bet_type === 'odd' && !isEven)) {
+      win = true;
+      user.balance += bet_amount * 2; // Выигрыш 2х
+    }
+
+    await user.save();
+
+    res.json({ 
+      success: true, 
+      score: score, // Это значение C++ игра использует для анимации броска
+      win: win, 
+      new_balance: user.balance 
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Запуск сервера
-app.listen(PORT, '0.0.0.0', () => {
+/* ========================================================
+   ЗАПУСК СЕРВЕРА
+   ======================================================== */
+app.listen(config.PORT, '0.0.0.0', async () => {
   console.log(`\n=========================================`);
-  console.log(` СЕРВЕР КАЗИНО (C++ BACKEND) ГОТОВ `);
-  console.log(` Порт: ${PORT}`);
+  console.log(` PRODUCTION БЭКЕНД КАЗИНО УСПЕШНО ЗАПУЩЕН `);
+  console.log(` Порт: ${config.PORT}`);
   console.log(`=========================================\n`);
+
+  if (process.env.SERVER_URL) {
+    await initWebhook(config.SERVER_URL);
+  }
 });
-  
+
